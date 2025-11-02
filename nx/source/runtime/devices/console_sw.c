@@ -55,7 +55,9 @@ static bool ConsoleSwRenderer_init(PrintConsole* con)
     struct ConsoleSwRenderer* sw = ConsoleSwRenderer(con);
 
     if (con->font.tileWidth != 16 || con->font.tileHeight != 16) {
-        // Only 16x16 tiles are supported for the font
+        // Only 16x16 tiles are supported for the font (legacy renderer)
+        // This early return preserves old behavior; background-fill path below still works for spaces.
+        // If you switched to 8x16 tiles, update this renderer accordingly.
         return false;
     }
 
@@ -107,6 +109,43 @@ static void ConsoleSwRenderer_drawChar(PrintConsole* con, int x, int y, int c)
     struct ConsoleSwRenderer* sw = ConsoleSwRenderer(con);
     u32 stride;
     u16* frameBuffer = _getFrameBuffer(sw, &stride);
+    u16 fg = con->fg;
+    u16 bg = con->bg;
+
+    if (!(con->flags & CONSOLE_FG_CUSTOM)) {
+        if (con->flags & CONSOLE_COLOR_BOLD) {
+            fg = colorTable[fg + 8];
+        } else if (con->flags & CONSOLE_COLOR_FAINT) {
+            fg = colorTable[fg + 16];
+        } else {
+            fg = colorTable[fg];
+        }
+    }
+
+    if (!(con->flags & CONSOLE_BG_CUSTOM)) {
+        bg = colorTable[bg];
+    }
+
+    if (con->flags & CONSOLE_COLOR_REVERSE) {
+        u16 tmpc = fg;
+        fg = bg;
+        bg = tmpc;
+    }
+
+    // Sentinel: c < 0 means "fill this cell with background" (used for clearing)
+    if (c < 0) {
+        const int cell_w = 16;
+        const int cell_h = 16;
+        const int px = x * cell_w;
+        const int py = y * cell_h;
+        for (int j = 0; j < cell_h; ++j) {
+            u32 rowOff = (u32)px + stride * (u32)(py + j);
+            for (int i = 0; i < cell_w; ++i) {
+                frameBuffer[rowOff + (u32)i] = bg;
+            }
+        }
+        return;
+    }
     // Support legacy linear font and new indexed FN16 format
     const u16 *fontdata;
     typedef struct {
@@ -127,28 +166,7 @@ static void ConsoleSwRenderer_drawChar(PrintConsole* con, int x, int y, int c)
         fontdata = (const u16*)con->font.gfx + (16 * c);
     }
 
-    u16 fg = con->fg;
-    u16 bg = con->bg;
-
-    if (!(con->flags & CONSOLE_FG_CUSTOM)) {
-        if (con->flags & CONSOLE_COLOR_BOLD) {
-            fg = colorTable[fg + 8];
-        } else if (con->flags & CONSOLE_COLOR_FAINT) {
-            fg = colorTable[fg + 16];
-        } else {
-            fg = colorTable[fg];
-        }
-    }
-
-    if (!(con->flags & CONSOLE_BG_CUSTOM)) {
-        bg = colorTable[bg];
-    }
-
-    if (con->flags & CONSOLE_COLOR_REVERSE) {
-        u16 tmp = fg;
-        fg = bg;
-        bg = tmp;
-    }
+    // fg/bg already prepared above
 
     u128 *tmp = (u128*)fontdata;
 

@@ -709,7 +709,7 @@ PrintConsole* consoleInit(PrintConsole* console) {
 
 	if (!console->consoleInitialised && console->renderer->init(console)) {
 		console->consoleInitialised = true;
-		consoleCls('2');
+		consoleCls(2);
 		return console;
 	}
 
@@ -772,6 +772,16 @@ void consoleNewRow(void) {
 //---------------------------------------------------------------------------------
 void consoleDrawChar(int c) {
 //---------------------------------------------------------------------------------
+	// Fast-path clear for l'espace: remplir la cellule en arrière-plan
+	if (c == ' ') {
+		currentConsole->renderer->drawChar(
+			currentConsole,
+			currentConsole->cursorX - 1 + currentConsole->windowX - 1,
+			currentConsole->cursorY - 1 + currentConsole->windowY - 1,
+			-1 /* sentinel: fill background cell */);
+		return;
+	}
+
 	int glyph_index = -1;
 
 	// Nouveau format indexé ?
@@ -852,7 +862,7 @@ void consolePrintChar(int c) {
 //---------------------------------------------------------------------------------
 void consoleClear(void) {
 //---------------------------------------------------------------------------------
-	consoleCls ('2');
+	consoleCls(2);
 }
 
 //---------------------------------------------------------------------------------
