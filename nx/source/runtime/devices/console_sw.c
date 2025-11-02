@@ -107,7 +107,25 @@ static void ConsoleSwRenderer_drawChar(PrintConsole* con, int x, int y, int c)
     struct ConsoleSwRenderer* sw = ConsoleSwRenderer(con);
     u32 stride;
     u16* frameBuffer = _getFrameBuffer(sw, &stride);
-    const u16 *fontdata = (const u16*)con->font.gfx + (16 * c);
+    // Support legacy linear font and new indexed FN16 format
+    const u16 *fontdata;
+    typedef struct {
+        u32 magic;
+        u16 version;
+        u16 cell_size;
+        u32 glyph_count;
+        u32 index_offset;
+        u32 bitmap_offset;
+    } __attribute__((packed)) Fn16Header;
+    #define FN16_MAGIC 0x464E3136u
+
+    const Fn16Header* hdr = (const Fn16Header*)con->font.gfx;
+    if (hdr && hdr->magic == FN16_MAGIC && hdr->cell_size == 16) {
+        const u8* base = (const u8*)con->font.gfx + hdr->bitmap_offset;
+        fontdata = (const u16*)(base + (size_t)c * 16 * sizeof(u16));
+    } else {
+        fontdata = (const u16*)con->font.gfx + (16 * c);
+    }
 
     u16 fg = con->fg;
     u16 bg = con->bg;

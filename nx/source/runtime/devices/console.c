@@ -6,6 +6,61 @@
 
 #include "default_font_bin.h"
 
+// --- Minimal UTF-8 decoder for the console ---
+typedef struct {
+	uint32_t codepoint;
+	int remaining;
+} Utf8State;
+
+static Utf8State g_utf8 = {0, 0};
+
+// --- New indexed font format (FN16) ---
+typedef struct {
+	u32 magic;         // 'FN16' = 0x464E3136
+	u16 version;       // 1
+	u16 cell_size;     // 16
+	u32 glyph_count;   // number of entries in the index
+	u32 index_offset;  // offset relative to the start of the data
+	u32 bitmap_offset; // offset relative to the start of the data
+} __attribute__((packed)) Fn16Header;
+
+#define FN16_MAGIC 0x464E3136u
+
+static inline bool _fontIsFn16(const void* gfx, Fn16Header* out_hdr) {
+	if (!gfx) return false;
+	const Fn16Header* h = (const Fn16Header*)gfx;
+	if (h->magic == FN16_MAGIC && h->cell_size == 16 && h->version >= 1) {
+		if (out_hdr) *out_hdr = *h;
+		return true;
+	}
+	return false;
+}
+
+static int _fn16LookupGlyph(const void* gfx, u32 codepoint) {
+	Fn16Header hdr;
+	if (!_fontIsFn16(gfx, &hdr)) return -1;
+	const u32* index = (const u32*)((const u8*)gfx + hdr.index_offset);
+	// Binary search
+	s32 lo = 0, hi = (s32)hdr.glyph_count - 1;
+	while (lo <= hi) {
+		s32 mid = lo + ((hi - lo) >> 1);
+		u32 v = index[mid];
+		if (v == codepoint) return mid;
+		if (v < codepoint) lo = mid + 1; else hi = mid - 1;
+	}
+	return -1;
+}
+
+static int _fn16LookupFallback(const void* gfx) {
+	// Try U+FFFD, then '?', then space
+	int idx = _fn16LookupGlyph(gfx, 0xFFFD);
+	if (idx >= 0) return idx;
+	idx = _fn16LookupGlyph(gfx, '?');
+	if (idx >= 0) return idx;
+	idx = _fn16LookupGlyph(gfx, ' ');
+	return idx;
+}
+
 static const u8 colorCube[] = {
 	0x00, 0x5f, 0x87, 0xaf, 0xd7, 0xff,
 };
@@ -420,168 +475,203 @@ static void consoleHandleColorEsc(int argCount)
 static ssize_t con_write(struct _reent *r,void *fd,const char *ptr, size_t len) {
 //---------------------------------------------------------------------------------
 
-	char chr;
+    int i = 0;
+    int count = 0;
+    const unsigned char *tmp = (const unsigned char*)ptr;
 
-	int i, count = 0;
-	char *tmp = (char*)ptr;
+    if(!tmp) return -1;
 
-	if(!tmp) return -1;
+    while(i < (int)len) {
 
-	i = 0;
-
-	while(i<len) {
-
-		chr = *(tmp++);
-		i++; count++;
-		switch (escapeSeq.state)
-		{
-		case ESC_NONE:
-			if (chr == 0x1b)
-				escapeSeq.state = ESC_START;
-			else
-				consolePrintChar(chr);
-			break;
-		case ESC_START:
-			if (chr == '[')
-			{
-				escapeSeq.state = ESC_BUILDING_UNKNOWN;
-				escapeSeq.hasArg = false;
-				memset(escapeSeq.args, 0, sizeof(escapeSeq.args));
-				escapeSeq.color.bg = currentConsole->bg;
-				escapeSeq.color.fg = currentConsole->fg;
-				escapeSeq.color.flags = currentConsole->flags;
-				escapeSeq.argIdx = 0;
-			}
-			else
-			{
-				consolePrintChar(0x1b);
-				consolePrintChar(chr);
-				escapeSeq.state = ESC_NONE;
-			}
-			break;
-		case ESC_BUILDING_UNKNOWN:
-			switch (chr)
-			{
-			case '0':
-			case '1':
-			case '2':
-			case '3':
-			case '4':
-			case '5':
-			case '6':
-			case '7':
-			case '8':
-			case '9':
-				escapeSeq.hasArg = true;
-				escapeSeq.args[escapeSeq.argIdx] = escapeSeq.args[escapeSeq.argIdx] * 10 + (chr - '0');
-				break;
-			case ';':
-				if (escapeSeq.hasArg) {
-					if (escapeSeq.argIdx < _ANSI_MAXARGS) {
-						escapeSeq.argIdx++;
+        unsigned char b = *(tmp++);
+        i++; count++;
+		// If we're not currently inside an ANSI escape sequence, perform UTF-8 decoding
+		if (escapeSeq.state == ESC_NONE) {
+			// Currently in the middle of a UTF-8 sequence?
+			if (g_utf8.remaining > 0) {
+				if ((b & 0xC0) == 0x80) {
+					// continuation byte
+					g_utf8.codepoint = (g_utf8.codepoint << 6) | (b & 0x3F);
+					g_utf8.remaining--;
+					if (g_utf8.remaining == 0) {
+						uint32_t cp = g_utf8.codepoint;
+						// full codepoint decoded, print it
+						consolePrintChar((int)cp);
 					}
+					continue; // byte consumed by the UTF-8 decoder
+				} else {
+					// invalid continuation byte -> reset state and reprocess this byte
+					g_utf8.remaining = 0;
 				}
-				escapeSeq.hasArg = false;
-				break;
-			//---------------------------------------			// Cursor directional movement
-			//---------------------------------------
-			case 'A':
-				if (!escapeSeq.hasArg && !escapeSeq.argIdx)
-					escapeSeq.args[0] = 1;
-				currentConsole->cursorY  =  currentConsole->cursorY - escapeSeq.args[0];
-				if (currentConsole->cursorY < 1)
-					currentConsole->cursorY = 1;
-				escapeSeq.state = ESC_NONE;
-				break;
-			case 'B':
-				if (!escapeSeq.hasArg && !escapeSeq.argIdx)
-					escapeSeq.args[0] = 1;
-				currentConsole->cursorY  =  currentConsole->cursorY + escapeSeq.args[0];
-				if (currentConsole->cursorY > currentConsole->windowHeight)
-					currentConsole->cursorY = currentConsole->windowHeight;
-				escapeSeq.state = ESC_NONE;
-				break;
-			case 'C':
-				if (!escapeSeq.hasArg && !escapeSeq.argIdx)
-					escapeSeq.args[0] = 1;
-				currentConsole->cursorX  =  currentConsole->cursorX  + escapeSeq.args[0];
-				if (currentConsole->cursorX > currentConsole->windowWidth)
-					currentConsole->cursorX = currentConsole->windowWidth;
-				escapeSeq.state = ESC_NONE;
-				break;
-			case 'D':
-				if (!escapeSeq.hasArg && !escapeSeq.argIdx)
-					escapeSeq.args[0] = 1;
-				currentConsole->cursorX  =  currentConsole->cursorX  - escapeSeq.args[0];
-				if (currentConsole->cursorX < 1)
-					currentConsole->cursorX = 1;
-				escapeSeq.state = ESC_NONE;
-				break;
-			//---------------------------------------
-			// Cursor position movement
-			//---------------------------------------
-			case 'H':
-			case 'f':
-				consolePosition(escapeSeq.args[1], escapeSeq.args[0]);
-				escapeSeq.state = ESC_NONE;
-				break;
-			//---------------------------------------
-			// Screen clear
-			//---------------------------------------
-			case 'J':
-				if (escapeSeq.argIdx == 0 && !escapeSeq.hasArg) {
-					escapeSeq.args[0] = 0;
-				}
-				consoleCls(escapeSeq.args[0]);
-				escapeSeq.state = ESC_NONE;
-				break;
-			//---------------------------------------
-			// Line clear
-			//---------------------------------------
-			case 'K':
-				if (escapeSeq.argIdx == 0 && !escapeSeq.hasArg) {
-					escapeSeq.args[0] = 0;
-				}
-				consoleClearLine(escapeSeq.args[0]);
-				escapeSeq.state = ESC_NONE;
-				break;
-			//---------------------------------------
-			// Save cursor position
-			//---------------------------------------
-			case 's':
-				currentConsole->prevCursorX  = currentConsole->cursorX ;
-				currentConsole->prevCursorY  = currentConsole->cursorY ;
-				escapeSeq.state = ESC_NONE;
-				break;
-			//---------------------------------------
-			// Load cursor position
-			//---------------------------------------
-			case 'u':
-				currentConsole->cursorX  = currentConsole->prevCursorX ;
-				currentConsole->cursorY  = currentConsole->prevCursorY ;
-				escapeSeq.state = ESC_NONE;
-				break;
-			//---------------------------------------
-			// Color scan codes
-			//---------------------------------------
-			case 'm':
-				if (escapeSeq.argIdx == 0 && !escapeSeq.hasArg) escapeSeq.args[escapeSeq.argIdx++] = 0;
-				if (escapeSeq.hasArg) escapeSeq.argIdx++;
-				consoleHandleColorEsc(escapeSeq.argIdx);
-				escapeSeq.state = ESC_NONE;
-				break;
-			default:
-				// some sort of unsupported escape; just gloss over it
-				escapeSeq.state = ESC_NONE;
-				break;
 			}
-		default:
-			break;
-		}
-	}
 
-	return count;
+			// Starting a new UTF-8 sequence
+			if (b < 0x80) {
+				// ASCII -> let the ANSI state machine handle it (ESC, etc.)
+			} else if (b >= 0xC2 && b <= 0xDF) {
+				g_utf8.codepoint = b & 0x1F;
+				g_utf8.remaining = 1;
+				continue;
+			} else if (b >= 0xE0 && b <= 0xEF) {
+				g_utf8.codepoint = b & 0x0F;
+				g_utf8.remaining = 2;
+				continue;
+			} else if (b >= 0xF0 && b <= 0xF4) {
+				g_utf8.codepoint = b & 0x07;
+				g_utf8.remaining = 3;
+				continue;
+			} else {
+				// invalid standalone byte
+				consolePrintChar('?');
+				continue;
+			}
+		}
+
+		// Original path: handle ANSI sequences and ASCII
+		char chr = (char)b;
+
+        switch (escapeSeq.state)
+        {
+        case ESC_NONE:
+            if (chr == 0x1b)
+                escapeSeq.state = ESC_START;
+            else
+                consolePrintChar((int)(unsigned char)chr);
+            break;
+        case ESC_START:
+            if (chr == '[')
+            {
+                escapeSeq.state = ESC_BUILDING_UNKNOWN;
+                escapeSeq.hasArg = false;
+                memset(escapeSeq.args, 0, sizeof(escapeSeq.args));
+                escapeSeq.color.bg = currentConsole->bg;
+                escapeSeq.color.fg = currentConsole->fg;
+                escapeSeq.color.flags = currentConsole->flags;
+                escapeSeq.argIdx = 0;
+            }
+            else
+            {
+                consolePrintChar(0x1b);
+                consolePrintChar(chr);
+                escapeSeq.state = ESC_NONE;
+            }
+            break;
+        case ESC_BUILDING_UNKNOWN:
+            switch (chr)
+            {
+            case '0': case '1': case '2': case '3': case '4':
+            case '5': case '6': case '7': case '8': case '9':
+                escapeSeq.hasArg = true;
+                escapeSeq.args[escapeSeq.argIdx] = escapeSeq.args[escapeSeq.argIdx] * 10 + (chr - '0');
+                break;
+            case ';':
+                if (escapeSeq.hasArg) {
+                    if (escapeSeq.argIdx < _ANSI_MAXARGS) {
+                        escapeSeq.argIdx++;
+                    }
+                }
+                escapeSeq.hasArg = false;
+                break;
+            //---------------------------------------			// Cursor directional movement
+            //---------------------------------------
+            case 'A':
+                if (!escapeSeq.hasArg && !escapeSeq.argIdx)
+                    escapeSeq.args[0] = 1;
+                currentConsole->cursorY  =  currentConsole->cursorY - escapeSeq.args[0];
+                if (currentConsole->cursorY < 1)
+                    currentConsole->cursorY = 1;
+                escapeSeq.state = ESC_NONE;
+                break;
+            case 'B':
+                if (!escapeSeq.hasArg && !escapeSeq.argIdx)
+                    escapeSeq.args[0] = 1;
+                currentConsole->cursorY  =  currentConsole->cursorY + escapeSeq.args[0];
+                if (currentConsole->cursorY > currentConsole->windowHeight)
+                    currentConsole->cursorY = currentConsole->windowHeight;
+                escapeSeq.state = ESC_NONE;
+                break;
+            case 'C':
+                if (!escapeSeq.hasArg && !escapeSeq.argIdx)
+                    escapeSeq.args[0] = 1;
+                currentConsole->cursorX  =  currentConsole->cursorX  + escapeSeq.args[0];
+                if (currentConsole->cursorX > currentConsole->windowWidth)
+                    currentConsole->cursorX = currentConsole->windowWidth;
+                escapeSeq.state = ESC_NONE;
+                break;
+            case 'D':
+                if (!escapeSeq.hasArg && !escapeSeq.argIdx)
+                    escapeSeq.args[0] = 1;
+                currentConsole->cursorX  =  currentConsole->cursorX  - escapeSeq.args[0];
+                if (currentConsole->cursorX < 1)
+                    currentConsole->cursorX = 1;
+                escapeSeq.state = ESC_NONE;
+                break;
+            //---------------------------------------
+            // Cursor position movement
+            //---------------------------------------
+            case 'H':
+            case 'f':
+                consolePosition(escapeSeq.args[1], escapeSeq.args[0]);
+                escapeSeq.state = ESC_NONE;
+                break;
+            //---------------------------------------
+            // Screen clear
+            //---------------------------------------
+            case 'J':
+                if (escapeSeq.argIdx == 0 && !escapeSeq.hasArg) {
+                    escapeSeq.args[0] = 0;
+                }
+                consoleCls(escapeSeq.args[0]);
+                escapeSeq.state = ESC_NONE;
+                break;
+            //---------------------------------------
+            // Line clear
+            //---------------------------------------
+            case 'K':
+                if (escapeSeq.argIdx == 0 && !escapeSeq.hasArg) {
+                    escapeSeq.args[0] = 0;
+                }
+                consoleClearLine(escapeSeq.args[0]);
+                escapeSeq.state = ESC_NONE;
+                break;
+            //---------------------------------------
+            // Save cursor position
+            //---------------------------------------
+            case 's':
+                currentConsole->prevCursorX  = currentConsole->cursorX ;
+                currentConsole->prevCursorY  = currentConsole->cursorY ;
+                escapeSeq.state = ESC_NONE;
+                break;
+            //---------------------------------------
+            // Load cursor position
+            //---------------------------------------
+            case 'u':
+                currentConsole->cursorX  = currentConsole->prevCursorX ;
+                currentConsole->cursorY  = currentConsole->prevCursorY ;
+                escapeSeq.state = ESC_NONE;
+                break;
+            //---------------------------------------
+            // Color scan codes
+            //---------------------------------------
+            case 'm':
+                if (escapeSeq.argIdx == 0 && !escapeSeq.hasArg) escapeSeq.args[escapeSeq.argIdx++] = 0;
+                if (escapeSeq.hasArg) escapeSeq.argIdx++;
+                consoleHandleColorEsc(escapeSeq.argIdx);
+                escapeSeq.state = ESC_NONE;
+                break;
+            default:
+                // unsupported escape; ignore
+                escapeSeq.state = ESC_NONE;
+                break;
+            }
+        default:
+            break;
+        }
+    }
+
+    return count;
 }
+// ...existing code...
 
 static const devoptab_t dotab_stdout = {
 	.name    = "con",
@@ -682,14 +772,27 @@ void consoleNewRow(void) {
 //---------------------------------------------------------------------------------
 void consoleDrawChar(int c) {
 //---------------------------------------------------------------------------------
-	c -= currentConsole->font.asciiOffset;
-	if ( c < 0 || c > currentConsole->font.numChars ) return;
+	int glyph_index = -1;
+
+	// Nouveau format indexé ?
+	if (_fontIsFn16(currentConsole->font.gfx, NULL)) {
+		glyph_index = _fn16LookupGlyph(currentConsole->font.gfx, (u32)c);
+		if (glyph_index < 0) {
+			glyph_index = _fn16LookupFallback(currentConsole->font.gfx);
+			if (glyph_index < 0) return; // rien à dessiner
+		}
+	} else {
+		// Ancien comportement: table linéaire
+		int idx = c - currentConsole->font.asciiOffset;
+		if (idx < 0 || idx > currentConsole->font.numChars) return;
+		glyph_index = idx;
+	}
 
 	currentConsole->renderer->drawChar(
 		currentConsole,
 		currentConsole->cursorX - 1 + currentConsole->windowX - 1,
 		currentConsole->cursorY - 1 + currentConsole->windowY - 1,
-		c);
+		glyph_index);
 }
 
 //---------------------------------------------------------------------------------
